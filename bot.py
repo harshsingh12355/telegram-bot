@@ -34,7 +34,7 @@ def save_data(data):
 async def ask_gemini(prompt: str) -> str:
     if not GEMINI_API_KEY:
         return "⚠️ Gemini API key not set. Add GEMINI_API_KEY in Railway Variables."
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(url, json=payload)
