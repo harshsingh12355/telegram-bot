@@ -11,11 +11,18 @@ from telegram.ext import (
 import httpx
  
 # ── Tokens (set as Railway environment variables) ──────────────────
-TELEGRAM_TOKEN = os.environ.get("TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-WEATHER_API_KEY = os.environ.get("WEATHER_API_KEY")   # openweathermap.org (free)
-NEWS_API_KEY    = os.environ.get("NEWS_API_KEY")       # newsapi.org (free)
-YOUR_CHAT_ID    = os.environ.get("YOUR_CHAT_ID")       # your Telegram user ID
+TELEGRAM_TOKEN  = os.environ.get("TOKEN")
+GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY")
+WEATHER_API_KEY = os.environ.get("WEATHER_API_KEY")
+NEWS_API_KEY    = os.environ.get("NEWS_API_KEY")
+YOUR_CHAT_ID    = os.environ.get("YOUR_CHAT_ID")
+ 
+# ── Logging setup ──────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s — %(name)s — %(levelname)s — %(message)s"
+)
+logger = logging.getLogger(__name__)
  
 # ── Simple file-based storage ──────────────────────────────────────
 DATA_FILE = "data.json"
@@ -30,19 +37,73 @@ def save_data(data):
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=2)
  
-# ── Gemini AI helper ───────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+#  GEMINI AI HELPER  ← FIXED
+#  - Updated to gemini-2.0-flash (latest stable)
+#  - Proper error logging so you see the REAL error
+#  - Returns the actual API error message if something goes wrong
+# ══════════════════════════════════════════════════════════════════
+ 
 async def ask_gemini(prompt: str) -> str:
     if not GEMINI_API_KEY:
-        return "⚠️ Gemini API key not set. Add GEMINI_API_KEY in Railway Variables."
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(url, json=payload)
-        result = r.json()
-        try:
-            return result["candidates"][0]["content"]["parts"][0]["text"]
-        except Exception:
-            return "⚠️ Gemini error. Please try again."
+        return (
+            "⚠️ Gemini API key not set.\n"
+            "Go to Railway → Your Project → Variables → Add GEMINI_API_KEY"
+        )
+ 
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+    )
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.7,
+            "maxOutputTokens": 1024
+        }
+    }
+ 
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(url, json=payload)
+            result = r.json()
+ 
+        # Log full response for debugging
+        logger.info(f"Gemini response status: {r.status_code}")
+        logger.info(f"Gemini raw response: {json.dumps(result, indent=2)[:500]}")
+ 
+        # Check for API-level errors (wrong key, quota, etc.)
+        if "error" in result:
+            err_msg = result["error"].get("message", "Unknown error")
+            err_code = result["error"].get("code", "")
+            logger.error(f"Gemini API error {err_code}: {err_msg}")
+            return (
+                f"⚠️ Gemini Error ({err_code}):\n{err_msg}\n\n"
+                "Check your GEMINI_API_KEY in Railway Variables."
+            )
+ 
+        # Check for safety blocks
+        candidate = result.get("candidates", [{}])[0]
+        finish_reason = candidate.get("finishReason", "")
+        if finish_reason == "SAFETY":
+            return "⚠️ Response blocked by safety filter. Please rephrase your question."
+ 
+        # Extract text
+        text = candidate["content"]["parts"][0]["text"]
+        return text.strip()
+ 
+    except httpx.TimeoutException:
+        logger.error("Gemini request timed out")
+        return "⚠️ Request timed out. Please try again."
+    except httpx.RequestError as e:
+        logger.error(f"Gemini network error: {e}")
+        return f"⚠️ Network error: {e}"
+    except (KeyError, IndexError) as e:
+        logger.error(f"Gemini parse error: {e} | Response: {result}")
+        return f"⚠️ Unexpected response from Gemini. Check Railway logs for details."
+    except Exception as e:
+        logger.error(f"Gemini unexpected error: {e}")
+        return f"⚠️ Unexpected error: {e}"
  
 # ── Main Menu keyboard ─────────────────────────────────────────────
 def main_menu():
@@ -184,7 +245,7 @@ async def notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         msg = "📝 *Your Notes:*\n\n"
         for i, n in enumerate(data["notes"], 1):
-            msg += f"{i}. {n['text']} _(_{n['date']}_)_\n"
+            msg += f"{i}. {n['text']} _({n['date']})_\n"
         msg += "\n`/note [text]` — Add note\n`/delnote [number]` — Delete note"
     await update.message.reply_text(msg, parse_mode="Markdown")
  
@@ -280,19 +341,27 @@ async def did_habit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today = str(datetime.date.today())
     data = load_data()
     if habit not in data["habits"]:
-        await update.message.reply_text(f"❌ Habit '{habit}' not found. Use `/addhabit {habit}` first.", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"❌ Habit '{habit}' not found. Use `/addhabit {habit}` first.",
+            parse_mode="Markdown"
+        )
         return
     h = data["habits"][habit]
     if today not in h["done_dates"]:
         h["done_dates"].append(today)
         h["streak"] = h.get("streak", 0) + 1
         save_data(data)
-        await update.message.reply_text(f"🔥 Great job! *{habit}* done today!\nStreak: {h['streak']} days!", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"🔥 Great job! *{habit}* done today!\nStreak: {h['streak']} days!",
+            parse_mode="Markdown"
+        )
     else:
         await update.message.reply_text(f"✅ You already completed *{habit}* today!", parse_mode="Markdown")
  
 # ══════════════════════════════════════════════════════════════════
-#  REMINDERS
+#  REMINDERS  ← FIXED
+#  - Was using asyncio.create_task() which gets garbage collected
+#  - Now uses context.application.create_task() (safe & persistent)
 # ══════════════════════════════════════════════════════════════════
  
 async def reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -306,48 +375,90 @@ async def reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
  
 # ══════════════════════════════════════════════════════════════════
-#  MORNING BRIEFING
+#  MORNING BRIEFING  ← FIXED
+#  - Now shows REAL error reason if weather/news API call fails
+#  - Better key validation: checks key exists AND is not empty string
+#  - Separate try/except per API so one failure doesn't kill the whole brief
 # ══════════════════════════════════════════════════════════════════
  
 async def morning_brief(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🌤 Fetching your morning brief...")
     brief = f"🌅 *Good Morning! — {datetime.date.today().strftime('%d %B %Y')}*\n\n"
  
-    # Weather
-    if WEATHER_API_KEY:
-        async with httpx.AsyncClient(timeout=10) as client:
-            try:
+    # ── Weather ────────────────────────────────────────────────────
+    weather_key = WEATHER_API_KEY and WEATHER_API_KEY.strip()
+    if not weather_key:
+        brief += "🌡 *Weather:* Add WEATHER_API_KEY in Railway Variables\n_(Get free key at openweathermap.org)_\n\n"
+    else:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
                 r = await client.get(
-                    f"https://api.openweathermap.org/data/2.5/weather",
-                    params={"q": "Begusarai,IN", "appid": WEATHER_API_KEY, "units": "metric"}
+                    "https://api.openweathermap.org/data/2.5/weather",
+                    params={
+                        "q": "Begusarai,IN",
+                        "appid": weather_key,
+                        "units": "metric"
+                    }
                 )
                 w = r.json()
-                temp = w["main"]["temp"]
-                desc = w["weather"][0]["description"].title()
-                brief += f"🌡 *Weather in Begusarai:*\n{desc}, {temp}°C\n\n"
-            except:
-                brief += "🌡 Weather unavailable\n\n"
-    else:
-        brief += "🌡 Add WEATHER_API_KEY in Railway Variables for weather\n\n"
+                logger.info(f"Weather API response: {w}")
  
-    # News
-    if NEWS_API_KEY:
-        async with httpx.AsyncClient(timeout=10) as client:
-            try:
+                if w.get("cod") != 200:
+                    # API returned an error (invalid key, city not found, etc.)
+                    err = w.get("message", "Unknown error")
+                    brief += f"🌡 *Weather Error:* {err}\n\n"
+                else:
+                    temp     = w["main"]["temp"]
+                    feels    = w["main"]["feels_like"]
+                    humidity = w["main"]["humidity"]
+                    desc     = w["weather"][0]["description"].title()
+                    brief += (
+                        f"🌡 *Weather in Begusarai:*\n"
+                        f"{desc}, {temp}°C (Feels like {feels}°C)\n"
+                        f"💧 Humidity: {humidity}%\n\n"
+                    )
+        except httpx.TimeoutException:
+            brief += "🌡 *Weather:* Request timed out. Try again.\n\n"
+        except Exception as e:
+            logger.error(f"Weather error: {e}")
+            brief += f"🌡 *Weather:* Error — {e}\n\n"
+ 
+    # ── News ───────────────────────────────────────────────────────
+    news_key = NEWS_API_KEY and NEWS_API_KEY.strip()
+    if not news_key:
+        brief += "📰 *News:* Add NEWS_API_KEY in Railway Variables\n_(Get free key at newsapi.org)_\n"
+    else:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
                 r = await client.get(
                     "https://newsapi.org/v2/top-headlines",
-                    params={"country": "in", "pageSize": 5, "apiKey": NEWS_API_KEY}
+                    params={
+                        "country": "in",
+                        "pageSize": 5,
+                        "apiKey": news_key
+                    }
                 )
                 news = r.json()
-                brief += "📰 *Top News Today:*\n"
-                for i, a in enumerate(news.get("articles", [])[:5], 1):
-                    brief += f"{i}. {a['title']}\n"
-            except:
-                brief += "📰 News unavailable\n"
-    else:
-        brief += "📰 Add NEWS_API_KEY in Railway Variables for news\n"
+                logger.info(f"News API status: {news.get('status')}")
  
-    # Todo summary
+                if news.get("status") != "ok":
+                    err = news.get("message", "Unknown error")
+                    brief += f"📰 *News Error:* {err}\n"
+                else:
+                    articles = news.get("articles", [])
+                    if articles:
+                        brief += "📰 *Top News Today:*\n"
+                        for i, a in enumerate(articles[:5], 1):
+                            brief += f"{i}. {a['title']}\n"
+                    else:
+                        brief += "📰 *News:* No articles found right now.\n"
+        except httpx.TimeoutException:
+            brief += "📰 *News:* Request timed out. Try again.\n"
+        except Exception as e:
+            logger.error(f"News error: {e}")
+            brief += f"📰 *News:* Error — {e}\n"
+ 
+    # ── Pending Todos ──────────────────────────────────────────────
     data = load_data()
     pending = [t for t in data["todos"] if not t.get("done")]
     if pending:
@@ -363,31 +474,43 @@ async def morning_brief(update: Update, context: ContextTypes.DEFAULT_TYPE):
  
 async def cricket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🏏 Fetching live cricket scores...")
+    rapidapi_key = os.environ.get("RAPIDAPI_KEY", "").strip()
+    if not rapidapi_key:
+        await update.message.reply_text(
+            "🏏 *Cricket Scores Setup Required*\n\n"
+            "1. Go to rapidapi.com\n"
+            "2. Search: _Cricbuzz Cricket_\n"
+            "3. Subscribe (free tier available)\n"
+            "4. Add your key as RAPIDAPI\\_KEY in Railway Variables",
+            parse_mode="Markdown"
+        )
+        return
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get("https://cricbuzz-cricket.p.rapidapi.com/matches/v1/live",
+            r = await client.get(
+                "https://cricbuzz-cricket.p.rapidapi.com/matches/v1/live",
                 headers={
-                    "X-RapidAPI-Key": os.environ.get("RAPIDAPI_KEY", ""),
+                    "X-RapidAPI-Key": rapidapi_key,
                     "X-RapidAPI-Host": "cricbuzz-cricket.p.rapidapi.com"
-                })
+                }
+            )
             matches = r.json()
             msg = "🏏 *Live Cricket Scores:*\n\n"
             found = False
             for match in matches.get("typeMatches", []):
                 for series in match.get("seriesMatches", []):
                     for m in series.get("seriesAdWrapper", {}).get("matches", [])[:3]:
-                        info = m.get("matchInfo", {})
-                        score = m.get("matchScore", {})
-                        t1 = info.get("team1", {}).get("teamSName", "")
-                        t2 = info.get("team2", {}).get("teamSName", "")
+                        info  = m.get("matchInfo", {})
+                        t1     = info.get("team1", {}).get("teamSName", "")
+                        t2     = info.get("team2", {}).get("teamSName", "")
                         status = info.get("status", "")
-                        msg += f"*{t1} vs {t2}*\n_{status}_\n\n"
-                        found = True
+                        msg   += f"*{t1} vs {t2}*\n_{status}_\n\n"
+                        found  = True
             if not found:
                 msg = "🏏 No live matches right now!\nCheck back during match time 🕐"
-    except Exception:
-        msg = ("🏏 Add RAPIDAPI_KEY in Railway Variables for live scores!\n\n"
-               "Get free key at: rapidapi.com\nSearch: Cricbuzz API")
+    except Exception as e:
+        logger.error(f"Cricket error: {e}")
+        msg = f"🏏 Cricket API error: {e}"
     await update.message.reply_text(msg, parse_mode="Markdown")
  
 # ══════════════════════════════════════════════════════════════════
@@ -398,13 +521,17 @@ async def joke_quote(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("😂 Fetching something fun...")
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get("https://v2.jokeapi.dev/joke/Programming,Miscellaneous?blacklistFlags=nsfw,racist")
+            r = await client.get(
+                "https://v2.jokeapi.dev/joke/Programming,Miscellaneous"
+                "?blacklistFlags=nsfw,racist"
+            )
             j = r.json()
             if j["type"] == "single":
                 msg = f"😂 *Joke:*\n\n{j['joke']}"
             else:
                 msg = f"😂 *Joke:*\n\n{j['setup']}\n\n_{j['delivery']}_"
-    except Exception:
+    except Exception as e:
+        logger.error(f"Joke API error: {e}")
         msg = "😄 Why do programmers prefer dark mode?\nBecause light attracts bugs! 🐛"
     await update.message.reply_text(msg, parse_mode="Markdown")
  
@@ -413,7 +540,7 @@ async def joke_quote(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════════════════
  
 async def my_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
+    data  = load_data()
     today = str(datetime.date.today())
     pending_todos = len([t for t in data["todos"] if not t.get("done")])
     done_todos    = len([t for t in data["todos"] if t.get("done")])
@@ -472,15 +599,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif mode == "interview":
         context.user_data["mode"] = ""
         await update.message.reply_text("💼 Preparing interview questions...")
-        prompt = (f"Give me 10 important interview questions with brief answers for: {text}. "
-                  f"Format nicely with Q: and A: labels.")
+        prompt = (
+            f"Give me 10 important interview questions with brief answers for: {text}. "
+            f"Format nicely with Q: and A: labels."
+        )
         reply = await ask_gemini(prompt)
         await update.message.reply_text(reply)
  
     elif mode == "translate":
         context.user_data["mode"] = ""
         await update.message.reply_text("🌍 Translating...")
-        reply = await ask_gemini(f"Translate the following text as requested. Only give the translation, nothing else: {text}")
+        reply = await ask_gemini(
+            f"Translate the following text as requested. Only give the translation, nothing else: {text}"
+        )
         await update.message.reply_text(reply)
  
     elif mode == "grammar":
@@ -494,16 +625,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif mode == "reminder":
         context.user_data["mode"] = ""
         try:
-            parts = text.split(" ", 1)
+            parts   = text.split(" ", 1)
             minutes = int(parts[0])
-            msg = parts[1] if len(parts) > 1 else "Reminder!"
+            msg     = parts[1] if len(parts) > 1 else "Reminder!"
+            chat_id = update.effective_chat.id
+ 
+            # ── FIXED: use application.create_task (won't get garbage collected) ──
             async def send_reminder():
                 await asyncio.sleep(minutes * 60)
-                await update.message.reply_text(f"⏰ *REMINDER:* {msg}", parse_mode="Markdown")
-            asyncio.create_task(send_reminder())
-            await update.message.reply_text(f"⏰ Reminder set! I'll remind you in *{minutes} minutes*: _{msg}_", parse_mode="Markdown")
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⏰ *REMINDER:* {msg}",
+                    parse_mode="Markdown"
+                )
+ 
+            context.application.create_task(send_reminder())
+            await update.message.reply_text(
+                f"⏰ Reminder set! I'll remind you in *{minutes} minutes*: _{msg}_",
+                parse_mode="Markdown"
+            )
         except Exception:
-            await update.message.reply_text("Format: `30 Call mom`\n_(minutes followed by message)_", parse_mode="Markdown")
+            await update.message.reply_text(
+                "Format: `30 Call mom`\n_(minutes followed by message)_",
+                parse_mode="Markdown"
+            )
  
     else:
         # Default — smart AI reply
@@ -515,22 +660,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  MAIN
 # ══════════════════════════════════════════════════════════════════
  
-logging.basicConfig(level=logging.INFO)
- 
 app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
  
-app.add_handler(CommandHandler("start",      start))
-app.add_handler(CommandHandler("help",       help_command))
-app.add_handler(CommandHandler("add",        add_todo))
-app.add_handler(CommandHandler("done",       done_todo))
-app.add_handler(CommandHandler("remove",     remove_todo))
-app.add_handler(CommandHandler("note",       add_note))
-app.add_handler(CommandHandler("delnote",    del_note))
-app.add_handler(CommandHandler("spend",      add_expense))
-app.add_handler(CommandHandler("clearexp",   clear_expenses))
-app.add_handler(CommandHandler("addhabit",   add_habit))
-app.add_handler(CommandHandler("did",        did_habit))
+app.add_handler(CommandHandler("start",     start))
+app.add_handler(CommandHandler("help",      help_command))
+app.add_handler(CommandHandler("add",       add_todo))
+app.add_handler(CommandHandler("done",      done_todo))
+app.add_handler(CommandHandler("remove",    remove_todo))
+app.add_handler(CommandHandler("note",      add_note))
+app.add_handler(CommandHandler("delnote",   del_note))
+app.add_handler(CommandHandler("spend",     add_expense))
+app.add_handler(CommandHandler("clearexp",  clear_expenses))
+app.add_handler(CommandHandler("addhabit",  add_habit))
+app.add_handler(CommandHandler("did",       did_habit))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
  
 print("🤖 Personal Assistant Bot is running...")
 app.run_polling()
+ 
